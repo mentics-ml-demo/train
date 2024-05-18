@@ -6,3 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+serde_json = "1.0.117"
+anyhow = "1.0.83"
+
+# shared-types = { git = "https://github.com/mentics-online-ml/shared-types.git", branch = "main" }
+shared-types = { path = "../shared-types" }
+# series-store = { git = "https://github.com/mentics-online-ml/series-store.git", branch = "main" }
+series-store = { path = "../series-store" }
