@@ -1,16 +1,22 @@
-use series_store::*;
+pub mod trainer;
+
 use shared_types::*;
+use series_store::*;
+use kv_store::*;
 
-
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let logger = StdoutLogger::boxed();
-
-    let mut reader = SeriesReader::new(logger)?;
     let topic = Topic::new("raw", "SPY", "quote");
-    reader.subscribe(&topic, Offset::Beginning)?;
-    let msgs = reader.read(100)?;
+
+    let mut series = SeriesReader::new(logger)?;
+    series.subscribe(&topic, Offset::Beginning)?;
+
+    let store = KVStore::new().await?;
+
+    let msgs = series.read_count(SERIES_LENGTH)?;
     println!("count: {}", msgs.len());
-    println!("first: {:?}", String::from_utf8(msgs[0].payload().unwrap().into())?);
+    println!("first: {:?}", msg_to::<QuoteEvent>(msgs.first().unwrap())?);
     Ok(())
 }
 
@@ -30,7 +36,7 @@ fn main() -> anyhow::Result<()> {
 }
 */
 ///
-pub struct Quote {
+pub struct InputQuote {
     pub bid: f32,
     pub bid_size: f32,
     pub bid_ts: u64,
