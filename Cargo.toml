@@ -18,6 +18,3 @@ shared-types = { path = "../shared-types" }
 series-store = { path = "../series-store" }
 # kv-store = { git = "https://github.com/mentics-online-ml/kv-store.git", branch = "main" }
 kv-store = { path = "../kv-store" }
-
-[profile.dev.package.burn]
-opt-level = 3
