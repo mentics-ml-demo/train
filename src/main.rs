@@ -1,11 +1,11 @@
 pub mod data;
-pub mod trainer;
+pub mod train;
 
 use shared_types::*;
 use series_store::*;
 use kv_store::*;
 use data::*;
-use trainer::*;
+use train::trainer::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,8 +14,8 @@ async fn main() -> anyhow::Result<()> {
     let series = SeriesReader::new(logger)?;
     let store = KVStore::new().await?;
 
-    let trainer = Trainer::new();
-    let data = DataMgr::new(CURRENT_VERSION, series, store, topic, trainer).await?;
+    let trainer = make_trainer();
+    let mut data = DataMgr::new(CURRENT_VERSION, series, store, topic, trainer).await?;
     data.run().await?;
 
     Ok(())
