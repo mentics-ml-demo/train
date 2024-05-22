@@ -27,6 +27,13 @@ impl DataMgr {
     pub async fn run(&mut self) -> anyhow::Result<u64> {
         let mut trained_event_id = self.store.max_trained_event_id(self.version).await?.unwrap_or(0);
         let mut count = 0;
+
+        // let labeleds = self.store.labeled_next(self.version, trained_event_id).await?;
+        // let labeled = labeleds.unwrap();
+        // self.series.seek(&self.data_topic, labeled.partition, Offset::Offset(labeled.offset - SERIES_LENGTH as i64 + 1))?;
+        // let quotes: Vec<QuoteEvent> = self.series.read_count_into(SERIES_LENGTH)?;
+        // let arr = quotes_to_arrays(quotes);
+
         loop {
             let labeleds = self.store.labeled_next(self.version, trained_event_id).await?;
             if labeleds.is_none() {
@@ -35,18 +42,17 @@ impl DataMgr {
 
             let labeled = labeleds.unwrap();
             self.series.seek(&self.data_topic, labeled.partition, Offset::Offset(labeled.offset - SERIES_LENGTH as i64 + 1))?;
-            println!("Reading in {SERIES_LENGTH} events from event_id: {}, offset: {}", labeled.event_id, labeled.offset);
+            println!("{}: read {SERIES_LENGTH} events at offset: {}", labeled.event_id, labeled.offset);
             let quotes: Vec<QuoteEvent> = self.series.read_count_into(SERIES_LENGTH)?;
             assert!(quotes.last().unwrap().event_id == labeled.event_id);
-            println!("training event_id: {}, label: {:?}", labeled.event_id, labeled.label);
             let arr = quotes_to_arrays(quotes);
-            // let lab = label_to_sarr(labeled.label);
-            self.trainer.train_1(arr, labeled.label.value);
+            self.trainer.train_full(arr, labeled.label.value)?;
             trained_event_id = labeled.event_id;
 
             count += 1;
-            if count > 2 { break; }
+            if count > 200 { break; }
         }
+        self.trainer.save_model()?;
         Ok(count)
     }
 
