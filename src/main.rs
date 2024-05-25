@@ -4,9 +4,6 @@ pub mod train;
 use std::env;
 
 use anyhow::Context;
-use shared_types::*;
-use series_store::*;
-use kv_store::*;
 use data::*;
 use train::trainer::*;
 
@@ -25,13 +22,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let logger = StdoutLogger::boxed();
-    let topic = Topic::new("raw", "SPY", "quote");
-    let series = SeriesReader::new(logger)?;
-    let store = KVStore::new().await?;
-
-    let trainer = make_trainer(path)?;
-    let mut data = DataMgr::new(CURRENT_VERSION, series, store, topic, trainer).await?;
+    let mut data = make_mgr(&path).await?;
     data.run().await?;
 
     Ok(())

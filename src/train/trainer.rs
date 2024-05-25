@@ -96,21 +96,22 @@ impl<B: AutodiffBackend> Trainer<B> {
         Ok(())
     }
 
-    pub fn train_full(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<()> {
+    pub fn train_full(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<TrainType> {
         // self.train_batch(input.to_tensor(&self.device), expected.to_tensor(&self.device))?;
         let inp = input.to_tensor(&self.device);
         let exp = expected.to_tensor(&self.device);
+        let mut res = TrainType::default();
         for _ in 0..10 {
-            self.train_1t(inp.clone(), exp.clone())?;
+            res = self.train_1t(inp.clone(), exp.clone())?;
         }
-        Ok(())
+        Ok(res)
     }
 
-    pub fn train_1(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<()> {
+    pub fn train_1(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<TrainType> {
         self.train_1t(input.to_tensor(&self.device), expected.to_tensor(&self.device))
     }
 
-    pub fn train_1t(&mut self, input: Tensor<B,2>, expected: Tensor<B,1>) -> anyhow::Result<()> {
+    pub fn train_1t(&mut self, input: Tensor<B,2>, expected: Tensor<B,1>) -> anyhow::Result<TrainType> {
         self.train(input.unsqueeze(), expected.unsqueeze())
     }
 
@@ -126,22 +127,24 @@ impl<B: AutodiffBackend> Trainer<B> {
     //     Ok(())
     // }
 
-    fn train(&mut self, input: Tensor<B,3>, expected: Tensor<B,2>) -> anyhow::Result<()> {
+    fn train(&mut self, input: Tensor<B,3>, expected: Tensor<B,2>) -> anyhow::Result<TrainType> {
         let model = self.model.take().with_context(|| "No model in trainer")?;
 
         println!("  Expect: {:?}", &expected.to_data());
         let output = model.forward(input.clone());
         println!("  Output: {:?}", &output.to_data());
         let loss = self.loss.forward(output, expected.clone(), Reduction::Mean);
+        // let loss_simple: TrainType = loss.to_data().value[0].elem();
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         let model2 = self.optimizer.step(self.config.learning_rate, model, grads);
 
         let output2 = model2.forward(input);
         let loss2 = self.loss.forward(output2, expected, Reduction::Mean);
+        let loss2_simple: TrainType = loss.to_data().value[0].elem();
         println!("  Loss: {} -> {}", loss.to_data(), loss2.to_data());
 
         self.model = Some(model2);
-        Ok(())
+        Ok(loss2_simple)
     }
 }
 
