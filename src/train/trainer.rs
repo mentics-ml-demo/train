@@ -101,9 +101,9 @@ impl<B: AutodiffBackend> Trainer<B> {
         let inp = input.to_tensor(&self.device);
         let exp = expected.to_tensor(&self.device);
         let mut res = TrainType::default();
-        for _ in 0..10 {
+        // for _ in 0..10 {
             res = self.train_1t(inp.clone(), exp.clone())?;
-        }
+        // }
         Ok(res)
     }
 

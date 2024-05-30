@@ -30,16 +30,25 @@ impl DataMgr {
         Self { version, series_labels, series_events, store, trainer }
     }
 
-    //
     // Loop through label events
     //  for each label event, loop through raw events until arriving at the event_id of the label event
     pub async fn run(&mut self) -> anyhow::Result<()> {
         self.series_labels.print_status()?;
+        self.series_events.print_status()?;
+
+        // TODO: series_events needs to seek to the offset of the first label event it's going to work off...
+        // just commiting offset in series_events will be too far forward when we start again.
+
         // let mut labevent: LabelEvent = self.series_labels.read_into()?;
         let mut buf = BufferEvents::new(SERIES_LENGTH, &self.series_events);
         loop {
-            println!("Reading from series");
             let labevent: LabelEvent = self.series_labels.read_into()?;
+            println!("Read label event: {:?}", labevent);
+            if !self.series_events.valid_offset_id(labevent.offset)? {
+                println!("Skipping label event with offset 0, event_id: {}", labevent.event_id);
+                continue;
+            }
+
             let data = buf.read_to(labevent.event_id)?;
             if data.len() < SERIES_LENGTH {
                 bail!("data too short: {}", data.len());
@@ -51,6 +60,7 @@ impl DataMgr {
             let arr = quotes_to_arrays(data)?;
             let train_result = self.trainer.train_full(arr, labevent.label.value)?;
             self.store(labevent.event_id, train_result).await?;
+            self.series_labels.commit()?;
             if true { break };
         }
         Ok(())
@@ -105,11 +115,11 @@ impl<'a> BufferEvents<'a> {
     pub fn read_to(&mut self, event_id: EventId) -> anyhow::Result<&VecDeque<QuoteEvent>> {
         // &'a Vec<QuoteEvent>
         loop {
-            let event: QuoteEvent = self.series_events.read_into()?;
-            println!("Read event {}", event.event_id);
+            let event: QuoteEvent = self.series_events.read_into_event()?;
+            // println!("Read event at offset {}", event.offset);
             if self.events.len() == self.target_length {
-                self.events.pop_front();
-                println!("pop_front called");
+                let front = self.events.pop_front();
+                println!("pop_front called at offset {}", front.unwrap().offset);
             }
             let found_event_id = event.event_id;
             self.events.push_back(event);
