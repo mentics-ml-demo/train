@@ -1,3 +1,4 @@
+use std::iter::zip;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -9,6 +10,8 @@ use burn::optim::{AdamW, AdamWConfig, GradientsParams, Optimizer};
 use burn::record::{CompactRecorder, Recorder};
 use burn::tensor::backend::AutodiffBackend;
 use burn::prelude::*;
+use tabled::builder::Builder;
+use tabled::settings::Style;
 
 use crate::train::model::*;
 use crate::train::data::*;
@@ -131,23 +134,65 @@ impl<B: AutodiffBackend> Trainer<B> {
 
     fn train(&mut self, input: Tensor<B,3>, expected: Tensor<B,2>) -> anyhow::Result<BatchTrainType> {
         let model = self.model.take().with_context(|| "No model in trainer")?;
+        let last_exp = last_index(&expected);
 
-        println!("  Expect: {:?}", &expected.to_data());
+        // println!("  Expect: {:?}", &expected.to_data());
         let output = model.forward(input.clone());
-        println!("  Output: {:?}", &output.to_data());
+        // println!("  Output: {:?}", &output.to_data());
         let loss = self.loss.forward(output, expected.clone(), Reduction::Mean);
         // let loss_simple: TrainType = loss.to_data().value[0].elem();
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         let model2 = self.optimizer.step(self.config.learning_rate, model, grads);
 
         let output2 = model2.forward(input);
-        let loss2 = self.loss.forward(output2, expected, Reduction::Mean);
-        let loss2_simple: BatchTrainType = loss.to_data().value.iter().map(|item| item.elem()).collect(); //[0].elem();
-        println!("  Loss: {} -> {}", loss.to_data(), loss2.to_data());
+        // let last_out2 = last_index(&output2);
+        // println!("Output: {}", last_out2);
+        // println!("Expected: {}", last_exp);
+
+        let mut losses = Vec::new();
+        let mut builder = Builder::default();
+        for (i, (out, exp)) in zip(output2.clone().iter_dim(0), expected.clone().iter_dim(0)).enumerate() {
+            let loss: ModelFloat = self.loss.forward(out.clone(), exp.clone(), Reduction::Sum).to_data().value[0].elem();
+            losses.push(loss);
+
+            let mut expected_row = exp.squeeze::<1>(0).to_data().value.iter().map(|item| to_result_str(item.elem::<f32>())).collect::<Vec<_>>();
+            expected_row.insert(0, String::default());
+            expected_row.insert(0, format!("{i}: expected"));
+            builder.push_record(expected_row);
+
+            let mut output_row = out.squeeze::<1>(0).to_data().value.iter().map(|item| to_result_str(item.elem::<f32>())).collect::<Vec<_>>();
+            output_row.insert(0, loss.to_string());
+            output_row.insert(0, format!("{i}: output"));
+            builder.push_record(output_row);
+        }
+
+        let mut columns = vec!["type".to_string(), "loss".to_string()];
+        columns.extend((0..MODEL_OUTPUT_WIDTH).map(|i| i.to_string()));
+        builder.insert_record(0, columns);
+        let mut table = builder.build();
+        table.with(Style::rounded());
+        println!("{table}");
+
+        // let loss2 = self.loss.forward(output2, expected, Reduction::Mean);
+        // let loss2_simple: BatchTrainType = loss.to_data().value.iter().map(|item| item.elem()).collect(); //[0].elem();
+        // println!("  Loss: {} -> {}", loss.to_data(), loss2.to_data());
 
         self.model = Some(model2);
-        Ok(loss2_simple)
+        Ok(losses)
     }
+}
+
+fn last_index<B:Backend>(tensor: &Tensor<B,2>) -> Tensor<B,1> {
+    let expected_shape = tensor.shape();
+    let last_index = expected_shape.dims[0] - 1;
+    tensor.clone().slice([last_index..(last_index+1), 0..MODEL_OUTPUT_WIDTH]).squeeze(0)
+}
+
+const STRING_ZERO: &str = "0";
+const STRING_ONE: &str = "1";
+
+fn to_result_str(x: f32) -> String {
+    (if x >= 0.5 { STRING_ONE } else { STRING_ZERO }).to_string()
 }
 
 pub trait ToTensor<B: Backend, const N: usize> {

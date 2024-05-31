@@ -18,3 +18,4 @@ shared-types = { path = "../shared-types" }
 series-store = { path = "../series-store" }
 # kv-store = { git = "https://github.com/mentics-online-ml/kv-store.git", branch = "main" }
 kv-store = { path = "../kv-store" }
+tabled = "0.15.0"

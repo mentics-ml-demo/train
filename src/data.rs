@@ -34,7 +34,7 @@ impl DataMgr {
     //  for each label event, loop through raw events until arriving at the event_id of the label event
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut count = 0;
-        let max = 10;
+        let max = 100;
 
         let mut first = true;
         // let mut labevent: LabelEvent = self.series_labels.read_into()?;
@@ -79,11 +79,12 @@ impl DataMgr {
             println!("Trained {} events. Train result: {:?}", num_inputs, batch_train_result);
             let train_result = batch_train_result.last().unwrap().to_owned();
             self.store(labevent.event_id, labevent.offset_from, train_result, new_input, new_label).await?;
-            // TODO: update the other events in trained with new loss values
+            // TODO: update the other events in trained store with new loss values
             self.series_labels.commit()?;
 
             count += 1;
             if count > max {
+                self.trainer.save_model()?;
                 println!("TODO: train debug stopping");
                 break;
             }
