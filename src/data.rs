@@ -34,7 +34,7 @@ impl DataMgr {
     //  for each label event, loop through raw events until arriving at the event_id of the label event
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut count = 0;
-        let max = 1;
+        let max = 10;
 
         let mut first = true;
         // let mut labevent: LabelEvent = self.series_labels.read_into()?;
@@ -63,9 +63,23 @@ impl DataMgr {
                 bail!("data wrong length: {} != {SERIES_LENGTH}", data.len());
             }
             assert!(data.back().unwrap().event_id == labevent.event_id);
-            let arr = series_to_input(data)?;
-            let train_result = self.trainer.train_full(arr, labevent.label.value)?;
-            self.store(labevent.event_id, labevent.offset_from, train_result, arr).await?;
+            let new_input = series_to_input(data)?;
+            let new_label = labevent.label;
+
+            let retrainers = self.store.train_loss(31).await?;
+            let (event_ids, (offsets, (inputs, labels))): (Vec<_>, (Vec<_>, (Vec<_>, Vec<_>))) = retrainers.into_iter().map(|row| (row.0, (row.3, (row.5, row.6)))).unzip();
+            // let inputs2 = inputs.into_iter().map(TryInto::<ModelInputFlat>::try_into).collect::<Result<Vec<_>,_>>().map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            let mut inputs2 = inputs.into_iter().map(vec_flat_to_input).collect::<Result<Vec<_>,_>>()?;
+            inputs2.push(new_input);
+            let mut labels2 = labels.into_iter().map(vec_flat_to_label).collect::<Result<Vec<_>,_>>()?;
+            labels2.push(new_label.value);
+            let num_inputs = inputs2.len();
+
+            let batch_train_result = self.trainer.train_batch(inputs2, labels2)?;
+            println!("Trained {} events. Train result: {:?}", num_inputs, batch_train_result);
+            let train_result = batch_train_result.last().unwrap().to_owned();
+            self.store(labevent.event_id, labevent.offset_from, train_result, new_input, new_label).await?;
+            // TODO: update the other events in trained with new loss values
             self.series_labels.commit()?;
 
             count += 1;
@@ -77,12 +91,12 @@ impl DataMgr {
         Ok(())
     }
 
-    async fn store(&self, event_id: EventId, offset: OffsetId, train: TrainType, arr: ModelInput) -> anyhow::Result<()> {
+    async fn store(&self, event_id: EventId, offset: OffsetId, train: TrainType, arr: ModelInput, label: Label) -> anyhow::Result<()> {
         let timestamp = now();
         let to_store = TrainStored {
             event_id, timestamp,
             partition: PARTITION, offset,
-            train: Train { loss: train }, input: arr
+            train: Train { loss: train }, input: arr, label
         };
         self.store.train_store(to_store).await
     }
@@ -162,3 +176,12 @@ where T: IntoIterator<Item = &'a QuoteEvent> {
 fn adjust(x: f32) -> f32 {
     (x - 0.5).clamp(0.0, 1.0)
 }
+
+fn vec_flat_to_input(v: Vec<ModelFloat>) -> anyhow::Result<ModelInput> {
+    Ok(to_model_input(TryInto::<ModelInputFlat>::try_into(v).map_err(|e| anyhow::anyhow!("{:?}", e))?))
+}
+
+fn vec_flat_to_label(v: Vec<ModelFloat>) -> anyhow::Result<LabelType> {
+    Ok(TryInto::<LabelType>::try_into(v).map_err(|e| anyhow::anyhow!("{:?}", e))?)
+}
+

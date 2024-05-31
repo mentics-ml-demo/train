@@ -93,19 +93,29 @@ impl<B: AutodiffBackend> Trainer<B> {
         Ok(())
     }
 
-    pub fn train_full(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<TrainType> {
+    /// # Shapes
+    ///   - Input [batch_size, SERIES_LENGTH, NUM_FEATURES]
+    ///   - Expected [batch_size, MODEL_OUTPUT_WIDTH]
+    ///   - Output [batch_size] of losses
+    pub fn train_batch(&mut self, input: impl ToTensor<B,3>, expected: impl ToTensor<B,2>) -> anyhow::Result<BatchTrainType> {
         let inp = input.to_tensor(&self.device);
         let exp = expected.to_tensor(&self.device);
-        self.train_1t(inp.clone(), exp.clone())
+        self.train(inp, exp)
     }
 
-    pub fn train_1(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<TrainType> {
-        self.train_1t(input.to_tensor(&self.device), expected.to_tensor(&self.device))
-    }
+    // pub fn train_full(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<TrainType> {
+    //     let inp = input.to_tensor(&self.device);
+    //     let exp = expected.to_tensor(&self.device);
+    //     self.train_1t(inp.clone(), exp.clone())
+    // }
 
-    pub fn train_1t(&mut self, input: Tensor<B,2>, expected: Tensor<B,1>) -> anyhow::Result<TrainType> {
-        self.train(input.unsqueeze(), expected.unsqueeze())
-    }
+    // pub fn train_1(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<TrainType> {
+    //     self.train_1t(input.to_tensor(&self.device), expected.to_tensor(&self.device))
+    // }
+
+    // pub fn train_1t(&mut self, input: Tensor<B,2>, expected: Tensor<B,1>) -> anyhow::Result<TrainType> {
+    //     self.train(input.unsqueeze(), expected.unsqueeze())
+    // }
 
     // pub fn train_1(&mut self, input: [[f32; NUM_FEATURES]; SERIES_LENGTH], expected: [f32; MODEL_OUTPUT_WIDTH]) -> anyhow::Result<()> {
     //     let x = Tensor::from_floats(input, &self.device).unsqueeze();
@@ -119,7 +129,7 @@ impl<B: AutodiffBackend> Trainer<B> {
     //     Ok(())
     // }
 
-    fn train(&mut self, input: Tensor<B,3>, expected: Tensor<B,2>) -> anyhow::Result<TrainType> {
+    fn train(&mut self, input: Tensor<B,3>, expected: Tensor<B,2>) -> anyhow::Result<BatchTrainType> {
         let model = self.model.take().with_context(|| "No model in trainer")?;
 
         println!("  Expect: {:?}", &expected.to_data());
@@ -132,7 +142,7 @@ impl<B: AutodiffBackend> Trainer<B> {
 
         let output2 = model2.forward(input);
         let loss2 = self.loss.forward(output2, expected, Reduction::Mean);
-        let loss2_simple: TrainType = loss.to_data().value[0].elem();
+        let loss2_simple: BatchTrainType = loss.to_data().value.iter().map(|item| item.elem()).collect(); //[0].elem();
         println!("  Loss: {} -> {}", loss.to_data(), loss2.to_data());
 
         self.model = Some(model2);
@@ -144,8 +154,25 @@ pub trait ToTensor<B: Backend, const N: usize> {
     fn to_tensor(self, device: &B::Device) -> Tensor<B,N>;
 }
 
-impl<B: Backend, const N: usize, K: Into<Data<f32,N>>> ToTensor<B,N> for K {
-    fn to_tensor(self, device: &B::Device) -> Tensor<B,N> {
-        Tensor::from_floats(self, device)
+// impl<B: Backend, const N: usize, K: Into<Data<f32,N>>> ToTensor<B,N> for K {
+//     fn to_tensor(self, device: &B::Device) -> Tensor<B,N> {
+//         Tensor::from_floats(self, device)
+//     }
+// }
+
+impl<B: Backend> ToTensor<B,3> for Vec<ModelInput> {
+    fn to_tensor(self, device: &B::Device) -> Tensor<B,3> {
+        // let x = Tensor::from_floats(self[0], device);
+        let x = self.into_iter().map(|input| Tensor::from_floats(input, device)).collect();
+        Tensor::stack(x, 0)
+        // TryInto::<[ModelInput; ]
+        // Tensor::from_floats(self, device)
+    }
+}
+
+impl<B: Backend> ToTensor<B,2> for Vec<LabelType> {
+    fn to_tensor(self, device: &B::Device) -> Tensor<B,2> {
+        let x = self.into_iter().map(|input| Tensor::from_floats(input, device)).collect();
+        Tensor::stack(x, 0)
     }
 }
