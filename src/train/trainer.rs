@@ -36,9 +36,6 @@ struct TheTrainingConfig {
 pub struct Trainer<B: AutodiffBackend> {
     device: B::Device,
     config: TheTrainingConfig,
-    dataset: TheDataset,
-    batcher: TheBatcher<B>,
-    // model: TheModel<B>,
     model: Option<TheModel<B>>,
     optimizer: OptimizerAdaptor<AdamW<B::InnerBackend>, TheModel<B>, B>,
     loss: MseLoss<B>,
@@ -62,7 +59,7 @@ pub fn make_trainer<P: AsRef<Path>>(artifact_dir: P) -> anyhow::Result<Trainer<T
 impl<B: AutodiffBackend> Trainer<B> {
     pub fn new<P: AsRef<Path>>(device: B::Device, artifact_dir: P) -> anyhow::Result<Self> {
         let base_path = artifact_dir.as_ref();
-        let model_config = TheModelConfig::new(NUM_FEATURES, SERIES_LENGTH, MODEL_OUTPUT_WIDTH);
+        let model_config = TheModelConfig::new(NUM_FEATURES, SERIES_SIZE, MODEL_OUTPUT_WIDTH);
         let dataset = TheDataset::train();
         let batcher = TheBatcher::<B>::new(device.clone());
         let mut model = model_config.init::<B>(&device);
@@ -85,7 +82,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             model = config.model.init::<B>(&device).load_record(record);
         }
 
-        Ok(Self { device, config, dataset, batcher, model: Some(model), loss, optimizer, artifact_dir: base_path.to_path_buf() })
+        Ok(Self { device, config, model: Some(model), loss, optimizer, artifact_dir: base_path.to_path_buf() })
     }
 
     pub fn save_model(&mut self) -> anyhow::Result<()> {
@@ -97,14 +94,9 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 
     pub fn train_full(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<TrainType> {
-        // self.train_batch(input.to_tensor(&self.device), expected.to_tensor(&self.device))?;
         let inp = input.to_tensor(&self.device);
         let exp = expected.to_tensor(&self.device);
-        let mut res = TrainType::default();
-        // for _ in 0..10 {
-            res = self.train_1t(inp.clone(), exp.clone())?;
-        // }
-        Ok(res)
+        self.train_1t(inp.clone(), exp.clone())
     }
 
     pub fn train_1(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<TrainType> {

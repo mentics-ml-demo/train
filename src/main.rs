@@ -5,6 +5,7 @@ use std::env;
 
 use anyhow::Context;
 use data::*;
+use shared_types::CURRENT_VERSION;
 use train::trainer::*;
 
 #[tokio::main]
@@ -22,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut data = make_mgr(&path).await?;
+    let mut data = make_mgr(CURRENT_VERSION, &path).await?;
     data.run().await?;
 
     Ok(())
