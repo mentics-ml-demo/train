@@ -1,11 +1,13 @@
-use std::{cmp::Ordering, collections::VecDeque, path::Path};
+use std::{cmp::Ordering, collections::VecDeque};
 
 use anyhow::bail;
-use shared_types::{util::now, *};
+use futures::future::join_all;
+
+use shared_types::{*, convert::*, util::now};
 use series_store::*;
 use kv_store::*;
 
-use crate::{make_trainer, train::trainer::Trainer, TheAutodiffBackend};
+use crate::{artifacts_dir, convert::*, train::trainer::{make_trainer, Trainer}, TheAutodiffBackend};
 
 pub struct DataMgr {
     _version: VersionType,
@@ -15,13 +17,26 @@ pub struct DataMgr {
     trainer: Trainer<TheAutodiffBackend>,
 }
 
-pub async fn make_mgr<P: AsRef<Path>>(version: VersionType, path: P) -> anyhow::Result<DataMgr> {
-    let series_labels = SeriesReader::new_topic(StdoutLogger::boxed(), &Topic::new("label", "SPY", "notify"))?;
-    let series_events = SeriesReader::new_topic(StdoutLogger::boxed(), &Topic::new("raw", "SPY", "quote"))?;
+pub async fn make_mgr(version: VersionType, reset: bool) -> anyhow::Result<DataMgr> {
+    let series_labels = SeriesReader::new_topic2(StdoutLogger::boxed(), "train", &Topic::new("label", "SPY", "notify"), reset)?;
+    let series_events = SeriesReader::new_topic2(StdoutLogger::boxed(), "train", &Topic::new("raw", "SPY", "quote"), reset)?;
     let store = KVStore::new(version).await?;
-    let trainer = make_trainer(path)?;
+    let trainer = make_trainer(reset)?;
 
-    Ok(DataMgr::new(version, series_labels, series_events, store, trainer))
+    let mgr = DataMgr::new(version, series_labels, series_events, store, trainer);
+
+    if reset {
+        println!("**** RESETTING TRAIN DATA ****");
+        println!("  resetting offsets");
+        mgr.reset_label_offset()?;
+        println!("  deleting train data");
+        mgr.reset_train_data().await?;
+        let path = artifacts_dir()?;
+        println!("  deleting model artifacts: {:?}", &path);
+        std::fs::remove_dir_all(&path)?;
+    }
+
+    Ok(mgr)
 }
 
 impl DataMgr {
@@ -30,16 +45,28 @@ impl DataMgr {
         Self { _version: version, series_labels, series_events, store, trainer }
     }
 
+    pub fn reset_label_offset(&self) -> anyhow::Result<()> {
+        self.series_labels.reset_offset()
+    }
+
+    pub async fn reset_train_data(&self) -> anyhow::Result<()> {
+        self.store.reset_train_data().await?;
+        Ok(())
+    }
+
     // Loop through label events
     //  for each label event, loop through raw events until arriving at the event_id of the label event
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self, run_count: usize) -> anyhow::Result<()> {
         let mut count = 0;
-        let max = 100;
+        let max = run_count;
 
         let mut first = true;
         // let mut labevent: LabelEvent = self.series_labels.read_into()?;
+        let mut prev_labevent = LabelEvent::default();
         let mut buf = BufferEvents::new(SERIES_SIZE, &self.series_events);
         loop {
+            let display_result = count % 100 == 0;
+            let timestamp = now();
             // self.series_labels.print_status()?;
             // self.series_events.print_status()?;
 
@@ -47,6 +74,11 @@ impl DataMgr {
             println!("Read label event: {:?}", labevent);
             if !self.series_events.valid_offset_ids(labevent.offset_from, labevent.offset_to)? {
                 println!("Skipping label event with offset 0, event_id: {}", labevent.event_id);
+                continue;
+            }
+
+            if labevent.event_id == prev_labevent.event_id {
+                println!("Found duplicate label event. Skipping:\n  {:?}\n  {:?}", labevent, prev_labevent);
                 continue;
             }
 
@@ -64,26 +96,52 @@ impl DataMgr {
             }
             assert!(data.back().unwrap().event_id == labevent.event_id);
             let new_input = series_to_input(data)?;
-            let new_label = labevent.label;
+            let new_label = labevent.label.clone(); // added clone to deal with checking for duplicates
 
-            let retrainers = self.store.train_loss(31).await?;
-            let (event_ids, (offsets, (inputs, labels))): (Vec<_>, (Vec<_>, (Vec<_>, Vec<_>))) = retrainers.into_iter().map(|row| (row.0, (row.3, (row.5, row.6)))).unzip();
-            // let inputs2 = inputs.into_iter().map(TryInto::<ModelInputFlat>::try_into).collect::<Result<Vec<_>,_>>().map_err(|e| anyhow::anyhow!("{:?}", e))?;
-            let mut inputs2 = inputs.into_iter().map(vec_flat_to_input).collect::<Result<Vec<_>,_>>()?;
-            inputs2.push(new_input);
-            let mut labels2 = labels.into_iter().map(vec_flat_to_label).collect::<Result<Vec<_>,_>>()?;
-            labels2.push(new_label.value);
-            let num_inputs = inputs2.len();
+            let mut retrainers = RetrainerData::new(self.store.train_top_full(63).await?)?;
+            let ret_top_count = retrainers.event_ids.len();
+            let ret2 = RetrainerData::new(self.store.train_oldest_full(32).await?)?;
+            let ret_oldest_count = ret2.event_ids.len();
+            retrainers.append(ret2);
+            let RetrainerData { event_ids, losses, mut inputs, mut labels } = retrainers;
 
-            let batch_train_result = self.trainer.train_batch(inputs2, labels2)?;
-            println!("Trained {} events. Train result: {:?}", num_inputs, batch_train_result);
-            let train_result = batch_train_result.last().unwrap().to_owned();
-            self.store(labevent.event_id, labevent.offset_from, train_result, new_input, new_label).await?;
-            // TODO: update the other events in trained store with new loss values
+            inputs.push(new_input);
+            labels.push(new_label.value);
+
+            let batch_train_result = self.trainer.train_batch(inputs, labels, display_result)?;
+            // println!("Trained {} events. Train result: {:?}", num_inputs, batch_train_result);
+            let new_loss = batch_train_result.last().unwrap().to_owned();
+            self.store_train_result(labevent.event_id, timestamp, labevent.offset_from, new_input, new_label, new_loss).await?;
+
+            let futures = (0..event_ids.len()).map(|i| {
+                self.store.train_loss_update(event_ids[i], timestamp, losses[i], batch_train_result[i])
+            });
+            let results = join_all(futures).await;
+            let errors = results.into_iter()
+                .filter(|result| result.is_err())
+                .map(|result| {
+                    println!("Error updating loss for retrainer: {:?}", result);
+                    result.unwrap_err()
+                }).collect::<Vec<_>>();
+            if !errors.is_empty() {
+                bail!("Errors updating loss for retrainers: {}", errors.len());
+            }
+
+            if display_result {
+                let mut event_ids_sorted = event_ids.clone();
+                event_ids_sorted.sort_unstable();
+                println!("Top EventIds being processed this time {} top, {} oldest: {:?}", ret_top_count, ret_oldest_count, event_ids_sorted);
+                self.trainer.save_model()?;
+            }
+
             self.series_labels.commit()?;
 
+            println!("Trained for label event_id: {:?}", labevent.event_id);
+            // self.series_labels.print_status()?;
+            prev_labevent = labevent;
+
             count += 1;
-            if count > max {
+            if count >= max {
                 self.trainer.save_model()?;
                 println!("TODO: train debug stopping");
                 break;
@@ -92,14 +150,40 @@ impl DataMgr {
         Ok(())
     }
 
-    async fn store(&self, event_id: EventId, offset: OffsetId, train: TrainType, arr: ModelInput, label: Label) -> anyhow::Result<()> {
-        let timestamp = now();
-        let to_store = TrainStored {
+    async fn store_train_result(&self, event_id: EventId, timestamp: Timestamp, offset: OffsetId, arr: ModelInput, label: Label, loss: TrainResultType) -> anyhow::Result<()> {
+        let train = TrainStored {
             event_id, timestamp,
             partition: PARTITION, offset,
-            train: Train { loss: train }, input: arr, label
+            input: arr, label
         };
-        self.store.train_store(to_store).await
+        self.store.train_store(train).await?;
+
+        let train_loss = TrainLossStored { event_id, timestamp, loss };
+        self.store.train_loss_store(train_loss).await
+    }
+}
+
+struct RetrainerData {
+    event_ids: Vec<u64>,
+    losses: Vec<f32>,
+    inputs: Vec<[[f32; 6]; 1024]>,
+    labels: Vec<[f32; 8]>
+}
+
+impl RetrainerData {
+    fn new(retrainers: Vec<TrainFull>) -> anyhow::Result<RetrainerData> {
+        let (event_ids, (inputs, (labels, losses))): (Vec<_>, (Vec<_>, (Vec<_>, Vec<_>))) =
+                retrainers.into_iter().map(|row| (row.event_id, (row.input_flat, (row.label_flat, row.loss)))).unzip();
+        let inputs = inputs.into_iter().map(vec_flat_to_input).collect::<Result<Vec<_>,_>>()?;
+        let labels = labels.into_iter().map(vec_flat_to_label).collect::<Result<Vec<_>,_>>()?;
+        Ok(RetrainerData { event_ids, losses, inputs, labels })
+    }
+
+    fn append(&mut self, mut to_append: RetrainerData) {
+        self.event_ids.append(&mut to_append.event_ids);
+        self.losses.append(&mut to_append.losses);
+        self.inputs.append(&mut to_append.inputs);
+        self.labels.append(&mut to_append.labels);
     }
 }
 
@@ -117,10 +201,10 @@ impl<'a> BufferEvents<'a> {
 
     pub fn read_to(&mut self, event_id: EventId) -> anyhow::Result<&VecDeque<QuoteEvent>> {
         // &'a Vec<QuoteEvent>
-        let mut count = 0;
+        // let mut count = 0;
         loop {
             let event: QuoteEvent = self.series_events.read_into_event()?;
-            count += 1;
+            // count += 1;
             // println!("Read event at offset {}, event_id: {}", event.offset, event.event_id);
             if self.events.len() == self.target_length {
                 let _ = self.events.pop_front();
@@ -133,56 +217,14 @@ impl<'a> BufferEvents<'a> {
             match found_event_id.cmp(&event_id) {
                 Ordering::Less => (), // Keep going
                 Ordering::Equal => {
-                    println!("Found matching event_id in events series {}, len: {}, after reading {count} events", event_id, self.events.len());
+                    // println!("Found matching event_id in events series {}, len: {}, after reading {count} events", event_id, self.events.len());
                     return Ok(&self.events);
                 },
                 Ordering::Greater => {
                     // Error, this shouldn't happen
-                    bail!("event_id {event_id} was missing in event stream");
+                    bail!("event_id {event_id} was missing in event stream, found {found_event_id}");
                 },
             }
         }
     }
 }
-
-fn series_to_input<'a, T>(v: T) -> anyhow::Result<[[f32; NUM_FEATURES]; SERIES_SIZE]>
-where T: IntoIterator<Item = &'a QuoteEvent> {
-    let mut iter = v.into_iter();
-    let mut arr = new_input();
-    for [bid, ask] in arr.iter_mut() {
-        if let Some(q) = iter.next() {
-            (*bid, *ask) = (q.bid, q.ask);
-        } else {
-            bail!("series_to_input: iterator had insufficient items");
-        }
-    }
-
-    if iter.next().is_some() {
-        bail!("series_to_input: iterator had extra items");
-    }
-
-    let [base_bid, base_ask] = arr[SERIES_SIZE - 1];
-    for [bid, ask] in arr.iter_mut() {
-        *bid = adjust(base_bid / *bid);
-        *ask = adjust(base_ask / *ask);
-    }
-    // TODO: remove this assert after test
-    for [a, b] in arr {
-        assert!(a > 0.0);
-        assert!(b > 0.0);
-    }
-    Ok(arr)
-}
-
-fn adjust(x: f32) -> f32 {
-    (x - 0.5).clamp(0.0, 1.0)
-}
-
-fn vec_flat_to_input(v: Vec<ModelFloat>) -> anyhow::Result<ModelInput> {
-    Ok(to_model_input(TryInto::<ModelInputFlat>::try_into(v).map_err(|e| anyhow::anyhow!("{:?}", e))?))
-}
-
-fn vec_flat_to_label(v: Vec<ModelFloat>) -> anyhow::Result<LabelType> {
-    Ok(TryInto::<LabelType>::try_into(v).map_err(|e| anyhow::anyhow!("{:?}", e))?)
-}
-

@@ -1,30 +1,29 @@
-pub mod data;
-pub mod train;
-
 use std::env;
 
-use anyhow::Context;
-use data::*;
 use shared_types::CURRENT_VERSION;
-use train::trainer::*;
+use train::{data::*, train::trainer::Trainer, TheAutodiffBackend};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let h = home::home_dir().with_context(|| "Could not get user home directory")?;
-    let path = h.join("data").join("models").join("oml");
-
+    let mut count = 1000;
+    let mut reset = false;
     let args: Vec<String> = env::args().collect();
-    println!("Found args: {:?}", args);
     if args.len() > 1 {
-        let arg = &args[1];
+        let mut index = 1;
+        let mut arg = &args[index];
         if arg == "reset" {
-            println!("Deleting artifacts: {:?}", &path);
-            std::fs::remove_dir_all(&path)?;
+            reset = true;
+            index += 1;
+        }
+        arg = &args[index];
+        if let Ok(arg_count) = arg.parse::<usize>() {
+            count = arg_count;
         }
     }
 
-    let mut data = make_mgr(CURRENT_VERSION, &path).await?;
-    data.run().await?;
+    // Trainer::<TheAutodiffBackend>::save_configs()?;
+    let mut data = make_mgr(CURRENT_VERSION, reset).await?;
+    data.run(count).await?;
 
     Ok(())
 }
