@@ -1,19 +1,19 @@
-use std::{cmp::Ordering, collections::VecDeque};
-
+use std::sync::Arc;
 use anyhow::bail;
-use futures::future::join_all;
+use async_scoped::TokioScope;
 
-use shared_types::{*, convert::*, util::now};
+use paths::artifacts_dir;
+use shared_types::{*, util::now};
 use series_store::*;
 use kv_store::*;
 
-use crate::{artifacts_dir, convert::*, train::trainer::{make_trainer, Trainer}, TheAutodiffBackend};
+use crate::{convert::*, events_window::EventsWindow, train::trainer::{make_trainer, Trainer}, TheAutodiffBackend};
 
 pub struct DataMgr {
     _version: VersionType,
-    series_labels: SeriesReader,
+    series_labels: Arc<SeriesReader>,
     series_events: SeriesReader,
-    store: KVStore,
+    store: Arc<KVStore>,
     trainer: Trainer<TheAutodiffBackend>,
 }
 
@@ -21,210 +21,193 @@ pub async fn make_mgr(version: VersionType, reset: bool) -> anyhow::Result<DataM
     let series_labels = SeriesReader::new_topic2(StdoutLogger::boxed(), "train", &Topic::new("label", "SPY", "notify"), reset)?;
     let series_events = SeriesReader::new_topic2(StdoutLogger::boxed(), "train", &Topic::new("raw", "SPY", "quote"), reset)?;
     let store = KVStore::new(version).await?;
-    let trainer = make_trainer(reset)?;
-
-    let mgr = DataMgr::new(version, series_labels, series_events, store, trainer);
 
     if reset {
         println!("**** RESETTING TRAIN DATA ****");
         println!("  resetting offsets");
-        mgr.reset_label_offset()?;
+        series_labels.reset_offset()?;
         println!("  deleting train data");
-        mgr.reset_train_data().await?;
+        store.reset_train_data().await?;
         let path = artifacts_dir()?;
         println!("  deleting model artifacts: {:?}", &path);
         std::fs::remove_dir_all(&path)?;
     }
 
+    let trainer = make_trainer(reset)?;
+    let mgr = DataMgr::new(version, series_labels, series_events, store, trainer);
     Ok(mgr)
 }
 
 impl DataMgr {
     pub fn new(version: VersionType, series_labels: SeriesReader, series_events: SeriesReader, store: KVStore, trainer: Trainer<TheAutodiffBackend>) -> Self { // -> anyhow::Result<Self> {
         // store.max_trained_event_id(version).await?;
-        Self { _version: version, series_labels, series_events, store, trainer }
+        Self { _version: version, series_labels: Arc::new(series_labels), series_events, store: Arc::new(store), trainer }
     }
 
-    pub fn reset_label_offset(&self) -> anyhow::Result<()> {
-        self.series_labels.reset_offset()
+    fn read_next_label(&self) -> anyhow::Result<LabelEvent> {
+        let result = loop {
+            let labevent: LabelEvent = self.series_labels.read_into()?;
+            // if !self.series_events.valid_offset_ids(labevent.offset_from, labevent.offset_to)? {
+            // TODO: it's expensive to fetch watermarks for every label event. is there another way to validate?
+            if labevent.offset_from <= 0 || labevent.offset_to <= 0 {
+                println!("Skipping label event with offset 0, event_id: {:?}", labevent);
+                continue
+            } else {
+                println!("Read label event: {:?}", labevent);
+                break labevent
+            };
+        };
+        Ok(result)
     }
 
-    pub async fn reset_train_data(&self) -> anyhow::Result<()> {
-        self.store.reset_train_data().await?;
-        Ok(())
+    fn read_next_label_no_dupe(&self, prev_labevent: &LabelEvent) -> anyhow::Result<LabelEvent> {
+        let result = loop {
+            let labevent = self.read_next_label()?;
+            if labevent.event_id == prev_labevent.event_id {
+                println!("Found duplicate label event. Skipping:\n  {:?}\n  {:?}", labevent, prev_labevent);
+                continue
+            } else {
+                break labevent
+            }
+        };
+        Ok(result)
+    }
+
+    fn seek_to_start(&self) -> anyhow::Result<LabelEvent> {
+        let labevent = self.read_next_label()?;
+        let target_position = labevent.offset_from - SERIES_LENGTH + 1;
+        println!("First time through loop, seeking to label event offset_from {} - num_series {} = {}, event_id: {}", labevent.offset_from, SERIES_LENGTH, target_position, labevent.event_id);
+        self.series_events.seek(target_position)?;
+        self.series_events.print_status()?;
+        Ok(labevent)
+    }
+
+    async fn store_train(store: Arc<KVStore>, series_labels: Arc<SeriesReader>, train: TrainStored) -> bool {
+        let rows_modified = err_return!(store.train_store(train).await, "Error storing train: {}", false);
+        if rows_modified != 1 {
+            println!("Storing train did not return 1 modified row: {}", rows_modified);
+        }
+        err_return!(series_labels.commit(), "Error commiting series_labels: {}", false);
+        true
+    }
+
+    async fn update_losses(store: Arc<KVStore>, event_ids: Vec<EventId>, new_losses: Vec<f32>) -> bool {
+        let expected_len = event_ids.len() as u64;
+        let rows_modified = err_return!(store.update_losses(event_ids, new_losses).await, "Error updating losses: {}", false);
+        if rows_modified != expected_len {
+            // NOTE: there's a chance the loss did not change, in which case this could happen
+            println!("Updating losses did not return expected modified row count: {}", rows_modified);
+        }
+        true
     }
 
     // Loop through label events
     //  for each label event, loop through raw events until arriving at the event_id of the label event
     pub async fn run(&mut self, run_count: usize) -> anyhow::Result<()> {
-        let mut count = 0;
-        let max = run_count;
+        let max_iter_per_loop = 63;
 
-        let mut first = true;
-        // let mut labevent: LabelEvent = self.series_labels.read_into()?;
-        let mut prev_labevent = LabelEvent::default();
-        let mut buf = BufferEvents::new(SERIES_SIZE, &self.series_events);
+        let mut buf = EventsWindow::new(SERIES_SIZE); // , &self.series_events
+        let mut prev_labevent = self.seek_to_start()?;
+        let (train, event_ids, new_losses) = self.train_event(&mut buf, &prev_labevent, false)?;
+        Self::store_train(self.store.clone(), self.series_labels.clone(), train).await;
+        Self::update_losses(self.store.clone(), event_ids, new_losses).await;
+        let mut count = 1;
+
         loop {
-            let display_result = count % 100 == 0;
-            let timestamp = now();
-            // self.series_labels.print_status()?;
-            // self.series_events.print_status()?;
+            let (cont, _) = TokioScope::scope_and_block(|scope| {
+                loop {
+                    if count >= run_count {
+                        if let Err(e) = self.trainer.save_model() {
+                            println!("Error saving model after traniing {}", e);
+                        }
+                        println!("TODO: train debug stopping");
+                        break false;
+                    }
 
-            let labevent: LabelEvent = self.series_labels.read_into()?;
-            println!("Read label event: {:?}", labevent);
-            if !self.series_events.valid_offset_ids(labevent.offset_from, labevent.offset_to)? {
-                println!("Skipping label event with offset 0, event_id: {}", labevent.event_id);
-                continue;
-            }
+                    let occasional = count % 100 == 0;
 
-            if labevent.event_id == prev_labevent.event_id {
-                println!("Found duplicate label event. Skipping:\n  {:?}\n  {:?}", labevent, prev_labevent);
-                continue;
-            }
+                    let labevent = err_return!(self.read_next_label_no_dupe(&prev_labevent), "Error reading next label: {}", false);
+                    let (train, event_ids, new_losses) = err_return!(self.train_event(&mut buf, &labevent, occasional), "Error training event: {}", false);
+                    scope.spawn(Self::store_train(self.store.clone(), self.series_labels.clone(), train));
+                    scope.spawn(Self::update_losses(self.store.clone(), event_ids, new_losses));
 
-            let target_position = labevent.offset_from - SERIES_LENGTH + 1;
-            if first {
-                println!("First time through loop, seeking to label event offset_from {} - num_series {} = {}, event_id: {}", labevent.offset_from, SERIES_LENGTH, target_position, labevent.event_id);
-                self.series_events.seek(target_position)?;
-                self.series_events.print_status()?;
-                first = false;
-            }
+                    prev_labevent = labevent;
 
-            let data = buf.read_to(labevent.event_id)?;
-            if data.len() != SERIES_SIZE {
-                bail!("data wrong length: {} != {SERIES_LENGTH}", data.len());
-            }
-            assert!(data.back().unwrap().event_id == labevent.event_id);
-            let new_input = series_to_input(data)?;
-            let new_label = labevent.label.clone(); // added clone to deal with checking for duplicates
+                    count += 1;
 
-            let mut retrainers = RetrainerData::new(self.store.train_top_full(63).await?)?;
-            let ret_top_count = retrainers.event_ids.len();
-            let ret2 = RetrainerData::new(self.store.train_oldest_full(32).await?)?;
-            let ret_oldest_count = ret2.event_ids.len();
-            retrainers.append(ret2);
-            let RetrainerData { event_ids, losses, mut inputs, mut labels } = retrainers;
+                    if count % 10 == 0 {
+                        println!("len: {}", scope.len());
+                        println!("remaining: {}", scope.remaining());
+                    }
 
-            inputs.push(new_input);
-            labels.push(new_label.value);
-
-            let batch_train_result = self.trainer.train_batch(inputs, labels, display_result)?;
-            // println!("Trained {} events. Train result: {:?}", num_inputs, batch_train_result);
-            let new_loss = batch_train_result.last().unwrap().to_owned();
-            self.store_train_result(labevent.event_id, timestamp, labevent.offset_from, new_input, new_label, new_loss).await?;
-
-            let futures = (0..event_ids.len()).map(|i| {
-                self.store.train_loss_update(event_ids[i], timestamp, losses[i], batch_train_result[i])
+                    if count % max_iter_per_loop == 0 {
+                        println!("Breaking inner loop to let threads catch up");
+                        println!("len: {}", scope.len());
+                        println!("remaining: {}", scope.remaining());
+                        break true;
+                    }
+                }
             });
-            let results = join_all(futures).await;
-            let errors = results.into_iter()
-                .filter(|result| result.is_err())
-                .map(|result| {
-                    println!("Error updating loss for retrainer: {:?}", result);
-                    result.unwrap_err()
-                }).collect::<Vec<_>>();
-            if !errors.is_empty() {
-                bail!("Errors updating loss for retrainers: {}", errors.len());
-            }
-
-            if display_result {
-                let mut event_ids_sorted = event_ids.clone();
-                event_ids_sorted.sort_unstable();
-                println!("Top EventIds being processed this time {} top, {} oldest: {:?}", ret_top_count, ret_oldest_count, event_ids_sorted);
-                self.trainer.save_model()?;
-            }
-
-            self.series_labels.commit()?;
-
-            println!("Trained for label event_id: {:?}", labevent.event_id);
-            // self.series_labels.print_status()?;
-            prev_labevent = labevent;
-
-            count += 1;
-            if count >= max {
-                self.trainer.save_model()?;
-                println!("TODO: train debug stopping");
+            if !cont {
                 break;
             }
         }
         Ok(())
     }
 
-    async fn store_train_result(&self, event_id: EventId, timestamp: Timestamp, offset: OffsetId, arr: ModelInput, label: Label, loss: TrainResultType) -> anyhow::Result<()> {
-        let train = TrainStored {
-            event_id, timestamp,
-            partition: PARTITION, offset,
-            input: arr, label
-        };
-        self.store.train_store(train).await?;
+    fn train_event(&mut self, buf: &mut EventsWindow, labevent: &LabelEvent, occasional: bool) -> anyhow::Result<(TrainStored, Vec<EventId>, Vec<ModelFloat>)> {
+        let (new_input, new_label) = self.read_next_input(buf, labevent)?;
 
-        let train_loss = TrainLossStored { event_id, timestamp, loss };
-        self.store.train_loss_store(train_loss).await
+        let timestamp = now();
+        let retrainers = futures::executor::block_on(self.store.retrainers(31, 32))?;
+        let retrainer_data = RetrainerData::new(retrainers);
+        let RetrainerData { event_ids, mut inputs, mut labels } = retrainer_data;
+        inputs.push(new_input);
+        labels.push(new_label.value);
+
+        let (new_losses, new_outputs) = self.trainer.train_batch(inputs, labels, occasional)
+                .map_err(|e| anyhow::anyhow!("train_batch error: {}", e))?;
+        // println!("Trained {} events. Train result: {:?}", num_inputs, batch_train_result);
+        let new_loss = new_losses.last().unwrap().to_owned();
+        let new_output = new_outputs.last().unwrap().to_owned();
+
+        if occasional {
+            println!("occasional start");
+            let mut event_ids_sorted = event_ids.clone();
+            event_ids_sorted.sort_unstable();
+            println!("EventIds being processed this time {} retrainers: {:?}", event_ids.len(), event_ids_sorted);
+            self.trainer.save_model()?;
+            println!("occasional end");
+        }
+
+        println!("Trained for label event_id: {:?}", labevent);
+
+        let train = TrainStored { event_id: labevent.event_id, timestamp, offset: labevent.offset_from, loss: new_loss, input: new_input, output: new_output };
+        Ok((train, event_ids, new_losses))
+    }
+
+    fn read_next_input(&mut self, buf: &mut EventsWindow, labevent: &LabelEvent) -> Result<([[f32; 6]; 1024], Label), anyhow::Error> {
+        let data = buf.read_to(labevent.event_id, &self.series_events)?;
+        if data.len() != SERIES_SIZE {
+            bail!("data wrong length: {} != {SERIES_LENGTH}", data.len());
+        }
+        assert!(data.back().unwrap().event_id == labevent.event_id);
+        let new_input = series_to_input(data)?;
+        let new_label = labevent.label.clone();
+        Ok((new_input, new_label))
     }
 }
 
 struct RetrainerData {
-    event_ids: Vec<u64>,
-    losses: Vec<f32>,
-    inputs: Vec<[[f32; 6]; 1024]>,
-    labels: Vec<[f32; 8]>
+    event_ids: Vec<EventId>,
+    inputs: Vec<ModelInput>,
+    labels: Vec<LabelType>
 }
 
 impl RetrainerData {
-    fn new(retrainers: Vec<TrainFull>) -> anyhow::Result<RetrainerData> {
-        let (event_ids, (inputs, (labels, losses))): (Vec<_>, (Vec<_>, (Vec<_>, Vec<_>))) =
-                retrainers.into_iter().map(|row| (row.event_id, (row.input_flat, (row.label_flat, row.loss)))).unzip();
-        let inputs = inputs.into_iter().map(vec_flat_to_input).collect::<Result<Vec<_>,_>>()?;
-        let labels = labels.into_iter().map(vec_flat_to_label).collect::<Result<Vec<_>,_>>()?;
-        Ok(RetrainerData { event_ids, losses, inputs, labels })
-    }
-
-    fn append(&mut self, mut to_append: RetrainerData) {
-        self.event_ids.append(&mut to_append.event_ids);
-        self.losses.append(&mut to_append.losses);
-        self.inputs.append(&mut to_append.inputs);
-        self.labels.append(&mut to_append.labels);
-    }
-}
-
-struct BufferEvents<'a> {
-    target_length: usize,
-    series_events: &'a SeriesReader,
-    events: VecDeque<QuoteEvent>,
-}
-
-impl<'a> BufferEvents<'a> {
-    pub fn new(target_length: usize, series_events: &'a SeriesReader) -> Self {
-        Self { target_length, series_events, events: VecDeque::new() }
-    }
-    // TODO: do we need to seek to the right place? or default use stored offset?
-
-    pub fn read_to(&mut self, event_id: EventId) -> anyhow::Result<&VecDeque<QuoteEvent>> {
-        // &'a Vec<QuoteEvent>
-        // let mut count = 0;
-        loop {
-            let event: QuoteEvent = self.series_events.read_into_event()?;
-            // count += 1;
-            // println!("Read event at offset {}, event_id: {}", event.offset, event.event_id);
-            if self.events.len() == self.target_length {
-                let _ = self.events.pop_front();
-                // let front = self.events.pop_front();
-                // println!("pop_front called at offset {}", front.unwrap().offset);
-            }
-            let found_event_id = event.event_id;
-            self.events.push_back(event);
-
-            match found_event_id.cmp(&event_id) {
-                Ordering::Less => (), // Keep going
-                Ordering::Equal => {
-                    // println!("Found matching event_id in events series {}, len: {}, after reading {count} events", event_id, self.events.len());
-                    return Ok(&self.events);
-                },
-                Ordering::Greater => {
-                    // Error, this shouldn't happen
-                    bail!("event_id {event_id} was missing in event stream, found {found_event_id}");
-                },
-            }
-        }
+    fn new(retrainers: Vec<TrainStoredWithLabel>) -> RetrainerData {
+        let (event_ids, (inputs, labels)): (Vec<_>, (Vec<_>, Vec<_>)) =
+            retrainers.into_iter().map(|train| (train.event_id, (train.input, train.label))).unzip();
+        RetrainerData { event_ids, inputs, labels }
     }
 }

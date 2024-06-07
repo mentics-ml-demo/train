@@ -1,4 +1,3 @@
-use anyhow::Context;
 use burn::module::AutodiffModule;
 use burn::nn::loss::{MseLoss, Reduction};
 use burn::optim::adaptor::OptimizerAdaptor;
@@ -8,7 +7,6 @@ use burn::prelude::*;
 
 use shared_types::*;
 use crate::model_persist::*;
-use crate::output::print_compare_table;
 use crate::train::model::*;
 use crate::TheAutodiffBackend;
 
@@ -89,10 +87,13 @@ impl<B: AutodiffBackend> Trainer<B> {
     ///   - Input [batch_size, SERIES_LENGTH, NUM_FEATURES]
     ///   - Expected [batch_size, MODEL_OUTPUT_WIDTH]
     ///   - Output [batch_size] of losses
-    pub fn train_batch(&mut self, input: impl ToTensor<B,3>, expected: impl ToTensor<B,2>, display_result: bool) -> anyhow::Result<BatchTrainResultType> {
+    pub fn train_batch(&mut self, input: impl ToTensor<B,3>, expected: impl ToTensor<B,2>, display_result: bool)
+            -> anyhow::Result<(Vec<f32>,Vec<ModelOutput>)> {
         let inp = input.to_tensor(&self.device);
         let exp = expected.to_tensor(&self.device);
-        self.train(inp, exp, display_result).map(tensor_to_vec_f32)
+        self.train(inp, exp, display_result).map(|(losses, outputs)| {
+            (tensor_to_vec_f32(losses), tensor_to_output(outputs))
+        })
     }
 
     // pub fn train_full(&mut self, input: impl ToTensor<B,2>, expected: impl ToTensor<B,1>) -> anyhow::Result<TrainType> {
@@ -121,11 +122,8 @@ impl<B: AutodiffBackend> Trainer<B> {
     //     Ok(())
     // }
 
-    fn train(&mut self, input: Tensor<B,3>, expected: Tensor<B,2>, display_result: bool) ->
-    // anyhow::Result<Tensor<B,1>>
-    anyhow::Result<Tensor<B::InnerBackend,1>>
-    {
-        let model = self.model.take().with_context(|| "No model in trainer")?;
+    fn train(&mut self, input: Tensor<B,3>, expected: Tensor<B,2>, _display_result: bool) -> anyhow::Result<(Tensor<B::InnerBackend,1>,Tensor<B::InnerBackend,2>)> {
+        let model = self.model.take().ok_or(anyhow::anyhow!("No model in trainer"))?;
         // let last_exp = last_index(&expected);
 
         // println!("  Expect: {:?}", &expected.to_data());
@@ -142,18 +140,25 @@ impl<B: AutodiffBackend> Trainer<B> {
         let validation_expected = expected.valid();
         let validation_losses = self.validation_loss.forward_no_reduction(validation_output.clone(), validation_expected.clone()).mean_dim(1).squeeze(1);
 
-        if display_result {
-            print_compare_table(validation_output, validation_expected, &validation_losses);
-        }
-
+        // if display_result {
+            // print_compare_table(validation_output.clone(), validation_expected, &validation_losses);
+        // }
 
         self.model = Some(model2);
-        Ok(validation_losses)
+        Ok((validation_losses, validation_output))
     }
 }
 
 fn tensor_to_vec_f32<B: Backend>(tensor: Tensor<B, 1>) -> Vec<f32> {
     tensor.into_data().convert::<f32>().value
+}
+
+fn tensor_to_output<B: Backend>(tensor: Tensor<B, 2>) -> Vec<ModelOutput> {
+    let flat = tensor.into_data().convert::<f32>().value;
+    flat.chunks_exact(MODEL_OUTPUT_WIDTH)
+        .map(TryInto::try_into)
+        .map(Result::unwrap)
+        .collect()
 }
 
 // fn last_index<B:Backend>(tensor: &Tensor<B,2>) -> Tensor<B,1> {

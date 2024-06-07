@@ -1,9 +1,9 @@
 use std::env;
 
 use shared_types::CURRENT_VERSION;
-use train::{data::*, train::trainer::Trainer, TheAutodiffBackend};
+use train::data::*;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> anyhow::Result<()> {
     let mut count = 1000;
     let mut reset = false;

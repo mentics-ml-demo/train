@@ -3,8 +3,8 @@ use burn::config::Config;
 use burn::module::Module;
 use burn::record::Recorder;
 use burn::{record::CompactRecorder, tensor::backend::Backend};
+use shared_types::paths::artifacts_dir;
 
-use crate::artifacts_dir;
 use crate::train::model::*;
 use crate::train::trainer::TheTrainingConfig;
 
@@ -28,11 +28,12 @@ pub fn load_model_config() -> anyhow::Result<TheModelConfig> {
 }
 
 pub fn save_model<B:Backend>(model: &TheModel<B>) -> anyhow::Result<()> {
+    print!("Saving model...");
     // TODO: save only occasionally? and coordinate with commiting offsets
     let path = artifacts_dir()?.join("model");
     // TODO: why have to clone?
     model.clone().save_file(&path, &CompactRecorder::new()).with_context(|| "Error saving model")?;
-    println!("Trained model saved: {:?}", &path);
+    println!(" saved to: {:?}", &path);
     Ok(())
 }
 
