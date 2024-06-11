@@ -1,6 +1,7 @@
 use std::{cmp::Ordering, collections::VecDeque};
 use anyhow::bail;
 
+use quote::QuoteEvent;
 use shared_types::*;
 use series_store::SeriesReader;
 

@@ -1,6 +1,6 @@
 use std::env;
 
-use shared_types::CURRENT_VERSION;
+use shared_types::data_info::CURRENT_VERSION;
 use train::data::*;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
