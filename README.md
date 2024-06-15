@@ -11,7 +11,7 @@ sudo apt-get install linux-tools-common linux-tools-generic linux-tools-`uname -
 # install flamegraph
 cargo install flamegraph
 # run executable with profiling
-flamegraph --no-inline -o ignore/my_flamegraph.svg -- ../target/debug/train
+flamegraph --no-inline -o ignore/my_flamegraph.svg -- ../target/debug/train 1
 flamegraph --no-inline -o ignore/my_flamegraph.svg -- ../target/release/train 20
 
 to do profiling:

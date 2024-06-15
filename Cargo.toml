@@ -11,7 +11,9 @@ async-scoped = { version = "0.9.0", features = ["tokio", "use-tokio"] }
 # Trim down features for tokio later
 tokio = { version = "1.37.0", features = ["full"] }
 # burn = { version = "0.13.2", features = ["train", "wgpu"] }
-burn = { git = "https://github.com/tracel-ai/burn.git", default-features = false, features = ["std", "autodiff", "wgpu", "fusion"] }
+# burn = { git = "https://github.com/tracel-ai/burn.git", default-features = false, features = ["std", "autodiff", "wgpu", "fusion"] }
+burn = { git = "https://github.com/tracel-ai/burn.git", default-features = false, features = ["std", "autodiff", "fusion", "candle-cuda"] }
+# burn = { path = "../../rust/burn", default-features = false, features = ["std", "autodiff", "wgpu", "fusion"] }
 # or maybe could use "train" and "sqlite_bundled" features instead of "autodiff" if I ever need dataset feature
 
 # shared-types = { git = "https://github.com/mentics-online-ml/shared-types.git", branch = "main" }
@@ -22,7 +24,8 @@ shared-burn = { path = "../shared-burn" }
 series-store = { path = "../series-store" }
 # kv-store = { git = "https://github.com/mentics-online-ml/kv-store.git", branch = "main" }
 kv-store = { path = "../kv-store" }
+itertools = "0.13.0"
 
-[target.x86_64-unknown-linux-gnu]
-linker = "/usr/bin/clang"
-rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
+#[target.x86_64-unknown-linux-gnu]
+#linker = "/usr/bin/clang"
+#rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
